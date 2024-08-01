@@ -1,5 +1,4 @@
 from __future__ import division
-import math
 from pyomo.environ import *
 import pandas as pd
 from csv import reader
@@ -11,7 +10,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 def formulate_mcc(nOrders, nLocations, nMobile, orders_info, orders_time, orders_size, locations_info, locations_time, vehicles_info, vehicles_size, travelTimes,
-				  canBeTransferredWith, objective, eligibleTypes, warmDelivery, warmPickup, warmY, warmT, warmL, warmArrival, warmDeparture, warmWaiting, maxOrders, serviceTime):
+				  canBeTransferredWith, objective, eligibleTypes, warmDelivery, warmPickup, warmY, warmL, warmArrival, warmDeparture, warmWaiting, maxOrders, serviceTime):
 	allMobile = [k for n in range(len(vehicles_info)) for k in vehicles_info[n, 0] if 'mobile' in vehicles_info[n, 1]]
 	copies = [[k for k in vehicles_info[n, 0]] for n in range(len(vehicles_info)) if 'mobile' in vehicles_info[n, 1]]
 
@@ -20,16 +19,18 @@ def formulate_mcc(nOrders, nLocations, nMobile, orders_info, orders_time, orders
 		for v in range(len(vehicles_info)):
 			if k in vehicles_info[v, 0]:
 				for t in eligibleTypes:
-					typeOfMDH = eligibleTypes.index(t)
-					break
+					if t in vehicles_info[v, 1]:
+						typeOfMDH = eligibleTypes.index(t)
+						break
 	if any("carrier" in vehicles_info[v, 1] for v in range(len(vehicles_info))):
 		typesOfLM = eligibleTypes.index("carrier")
 	else:
 		for v in range(len(vehicles_info)):
 			if "last-mile" in vehicles_info[v, 1]:
 				for t in eligibleTypes:
-					typesOfLM = eligibleTypes.index(t)		
-	minInterval = 5
+					if t in vehicles_info[v, 1]:
+						typesOfLM = eligibleTypes.index(t)
+	numLm = len([v for v in range(len(vehicles_info)) if "last-mile" in vehicles_info[v, 1]])
 
 	model = ConcreteModel()
 	# Sets
@@ -41,25 +42,40 @@ def formulate_mcc(nOrders, nLocations, nMobile, orders_info, orders_time, orders
 	# Variables
 	model.xDelivery = Var(model.Orders, model.Locations, model.Mobile, within = Binary)
 	model.xPickup = Var(model.Orders, model.Locations, model.Mobile, within = Binary)
-	model.y = Var(model.Hubs, model.Mobile, within = Binary)
+	model.y = Var(model.Locations, model.Mobile, within = Binary)
 	model.t = Var(model.Mobile, within = Binary)
 	model.l = Var(model.Locations, model.Locations, model.Mobile, within = Binary)
 	def operating_hours(model, j, k):
-		return (int(locations_time[j, 0]/minInterval), int((locations_time[j, 1])/minInterval))
+		return int(locations_time[j, 0]), int((locations_time[j, 1]))
 	model.Arrival = Var(model.Locations, model.Mobile, within = NonNegativeIntegers, bounds = operating_hours)
 	model.Departure = Var(model.Locations, model.Mobile, within = NonNegativeIntegers, bounds = operating_hours)
 	model.Waiting = Var(model.Locations, model.Mobile, within = NonNegativeIntegers)
+	def capacitated(model, j, k):
+		for v in range(len(vehicles_info)):
+			if k in vehicles_info[v, 0]:
+				break
+		return (0, 0.9*vehicles_size[v, 0])
+	model.Weight = Var(model.Locations, model.Mobile, within = NonNegativeReals, bounds = capacitated)
+	def capacitated(model, j, k):
+		for v in range(len(vehicles_info)):
+			if k in vehicles_info[v, 0]:
+				break
+		return (0, 0.9*vehicles_size[v, 1])
+	model.Volume = Var(model.Locations, model.Mobile, within = NonNegativeReals, bounds = capacitated)
+	model.Loaded = Var(model.Orders, within = NonNegativeIntegers)
+	model.Released = Var(model.Orders, within = NonNegativeIntegers)
+
+	model.z = Var(within = NonNegativeReals)
+
 	try:
 		if warmL != None:
 			for i in model.Orders:
 				for j in model.Locations:
 					for k in model.Mobile:
 						model.xPickup[i, j, k], model.xDelivery[i, j, k] = warmPickup[i][j][k], warmDelivery[i][j][k]
-			for j in model.Hubs:
+			for j in model.Locations:
 				for k in model.Mobile:
 					model.y[j, k] = warmY[j][k]
-			for k in model.Mobile:
-				model.t[k] = warmT[k]
 			for i in model.Locations:
 				for j in model.Locations:
 					for k in model.Mobile:
@@ -71,15 +87,6 @@ def formulate_mcc(nOrders, nLocations, nMobile, orders_info, orders_time, orders
 	except Exception:
 		pass
 
-	for k in model.Mobile:
-		for v in range(len(vehicles_info)):
-			if k in vehicles_info[v, 0]:
-				if maxOrders == nOrders:
-					nTrips = max([math.ceil(sum([orders_size[i, 0] for i in model.Orders])/vehicles_size[v, 0]), math.ceil(sum([orders_size[i, 1] for i in model.Orders])/vehicles_size[v, 1]), math.ceil(sum([orders_size[i, 5] for i in model.Orders])/vehicles_size[v, 5])])
-				else:
-					nTrips = 0
-	model.z = Var(within = NonNegativeReals)
-
 	def obj_rule(model):
 		return model.z
 	if "min" in objective:
@@ -89,194 +96,190 @@ def formulate_mcc(nOrders, nLocations, nMobile, orders_info, orders_time, orders
 
 	model.constraints = ConstraintList()
 
-	if objective == "min-travelTime": # Minimisation of total travel time
-		model.constraints.add(model.z >= sum(travelTimes[i, j, typeOfMDH]*model.l[i, j, k] for i in model.Locations for j in model.Locations for k in model.Mobile) +
-										sum((travelTimes[j, orders_info[i, 5], typesOfLM] + travelTimes[orders_info[i, 5], j, typesOfLM])*model.xDelivery[i, j, k] for i in model.Orders for j in model.Locations for k in model.Mobile) + 
-										sum((travelTimes[j, orders_info[i, 4], typesOfLM] + travelTimes[orders_info[i, 4], j, typesOfLM])*model.xPickup[i, j, k] for i in model.Orders for j in model.Locations for k in model.Mobile))
-		model.constraints.add(sum(model.xDelivery[i, j, k] for i in model.Orders for j in model.Locations for k in model.Mobile) == maxOrders) # Each order is assigned to a location from which the delivery will begin.
-		model.constraints.add(sum(model.xPickup[i, j, k] for i in model.Orders for j in model.Locations for k in model.Mobile) == maxOrders) # Each order is assigned to a location from which the pickup will begin.
-		model.constraints.add(sum(model.t[k] for k in model.Mobile) >= nTrips) # The weight/volume of demand indicates the minimum required number of trips.
-	if objective == "max-coveredDemand": # Maximisation of covered demand
-		model.constraints.add(model.z <= sum(model.xDelivery[i, j, k] + model.xPickup[i, j, k] for i in model.Orders for j in model.Locations for k in model.Mobile))
-	for i in model.Orders:
-		if orders_info[i, 4] not in model.Depots:
-			model.constraints.add(sum(model.xPickup[i, j, k] for j in model.Depots for k in model.Mobile) == 0.0)
-		if orders_info[i, 5] not in model.Depots:
-			model.constraints.add(sum(model.xDelivery[i, j, k] for j in model.Depots for k in model.Mobile) == 0.0)
-		model.constraints.add(sum(model.xDelivery[i, j, k] for j in model.Locations for k in model.Mobile) <= 1) # Each order is assigned to no more than one location from which the delivery will begin.
-		model.constraints.add(sum(model.xPickup[i, j, k] for j in model.Locations for k in model.Mobile) <= 1) # Each order is assigned to no more than one location from which the pickup will begin.
+	if "min" in objective:
+		model.constraints.add(model.z >= sum((travelTimes[orders_info[n, 4], j, typesOfLM] + travelTimes[j, orders_info[n, 4], typesOfLM])*model.xPickup[n, j, k] for j in model.Locations for k in model.Mobile for n in model.Orders) + 
+						sum((travelTimes[orders_info[n, 5], j, typesOfLM] + travelTimes[j, orders_info[n, 5], typesOfLM])*model.xDelivery[n, j, k] for j in model.Locations for k in model.Mobile for n in model.Orders) + 
+						sum(travelTimes[i, j, typeOfMDH]*numLm*model.l[i, j, k] for i in model.Locations for j in model.Locations for k in model.Mobile))
+	else:
+		model.constraints.add(model.z <= sum(model.xPickup[n, j, k] + model.xDelivery[n, j, k] for n in model.Orders for j in model.Locations for k in model.Mobile))
+
+	# All orders are picked-up and delivered to exactly one stop.
+	if "min" in objective:
+		model.constraints.add(sum(model.xPickup[n, j, k] + model.xDelivery[n, j, k] for n in model.Orders for j in model.Locations for k in model.Mobile) == 2*maxOrders)
+	for n in model.Orders:
+		model.constraints.add(model.Loaded[n] <= model.Released[n])
+		if orders_info[n, 4] in model.Depots:
+			model.constraints.add(sum(model.xPickup[n, j, k] for k in model.Mobile for j in model.Locations if j != orders_info[n, 4]) == 0.0)
+		if orders_info[n, 5] in model.Depots:
+			model.constraints.add(sum(model.xDelivery[n, j, k] for k in model.Mobile for j in model.Locations if j != orders_info[n, 5]) == 0.0)
+		if orders_info[n, 10] == 1.0:
+			for j in model.Depots:
+				for k in model.Mobile:
+					model.constraints.add(model.xDelivery[n, j, k] == 0.0)
+		model.constraints.add(sum(model.xPickup[n, j, k] for j in model.Locations for k in model.Mobile) <= 1.0)
+		model.constraints.add(sum(model.xDelivery[n, j, k] for j in model.Locations for k in model.Mobile) <= 1.0)
+		# The mobile depot will visit any assigned stop.
 		for k in model.Mobile:
-			model.constraints.add(sum(model.xPickup[i, j, k] for j in model.Locations) == sum(model.xDelivery[i, j, k] for j in model.Locations)) # If an order is picked up, it will also be delivered.
+			model.constraints.add(sum(model.xPickup[n, j, k] for j in model.Locations) == sum(model.xDelivery[n, j, k] for j in model.Locations))
 			for j in model.Locations:
-				model.constraints.add(model.xPickup[i, j, k] + model.xDelivery[i, j, k] <= 1.0)
-				if eligibleTypes[typesOfLM] == "carrier" and travelTimes[j, orders_info[i, 5], typesOfLM] > 10:
-					model.constraints.add(model.xDelivery[i, j, k] == 0.0)
-				if j not in model.Depots:
-					model.constraints.add(model.xDelivery[i, j, k] <= model.y[j, k]) #An order can be assigned for delivery to an open location.
-					model.constraints.add(model.xPickup[i, j, k] <= model.y[j, k]) #An order can be assigned for pickup to an open location.
-				# Constraints to respect time windows/release times
-				model.constraints.add(minInterval*model.Arrival[j, k] + travelTimes[j, orders_info[i, 5], typesOfLM] - orders_time[i, 2] <= (locations_time[j, 1] + travelTimes[j, orders_info[i, 5], typesOfLM])*(1 - model.xDelivery[i, j, k]))
-				if j not in model.Depots:
-					model.constraints.add(minInterval*model.Waiting[j, k] >= (travelTimes[j, orders_info[i, 5], typesOfLM] + travelTimes[orders_info[i, 5], j, typesOfLM] + serviceTime)*model.xDelivery[i, j, k])
-					model.constraints.add(minInterval*model.Waiting[j, k] >= (travelTimes[j, orders_info[i, 4], typesOfLM] + travelTimes[orders_info[i, 4], j, typesOfLM] + serviceTime)*model.xPickup[i, j, k])
-				else:
-					model.constraints.add(minInterval*model.Waiting[j, k] >= (serviceTime)*model.xPickup[i, j, k])
-				model.constraints.add(orders_time[i, 1] - travelTimes[j, orders_info[i, 5], typesOfLM] - minInterval*model.Departure[j, k] <= orders_time[i, 1]*(1 - model.xDelivery[i, j, k]))
-				model.constraints.add(orders_time[i, 1] + travelTimes[j, orders_info[i, 5], typesOfLM] + serviceTime + travelTimes[orders_info[i, 5], j, typesOfLM] - minInterval*model.Departure[j, k] <= (orders_time[i, 1] + travelTimes[j, orders_info[i, 5], typesOfLM] + serviceTime)*(1 - model.xDelivery[i, j, k]))
-				if orders_info[i, 3] == 1:
-					model.constraints.add(orders_time[i, 0] + travelTimes[orders_info[i, 4], j, typesOfLM] - minInterval*model.Departure[j, k] <= (orders_time[i, 0] + travelTimes[orders_info[i, 4], j, typesOfLM])*(1 - model.xPickup[i, j, k]))
-				for l in model.Locations:
-					for m in model.Mobile:
-						model.constraints.add(model.Departure[l, k] - model.Arrival[j, m] <= (locations_time[l, 1])*(2 - model.xPickup[i, l, k] - model.xDelivery[i, j, m])) # Precedence constraint: The pickup location should be visited before the delivery location for all orders.
+				model.constraints.add(model.y[j, k] >= model.xPickup[n, j, k])
+				model.constraints.add(model.y[j, k] >= model.xDelivery[n, j, k])
+				#if eligibleTypes[typesOfLM] == "carrier" and travelTimes[j, orders_info[n, 5], typesOfLM] > 10:
+				#	model.constraints.add(model.xDelivery[n, j, k] == 0.0)
+	
+	# Route assigned vehicles
 	for k in model.Mobile:
-		for i in model.Orders:
-			for j in model.Orders:
-				if i != j and (canBeTransferredWith[i, j] == 0 or canBeTransferredWith[j, i] == 0):
-					model.constraints.add(sum(model.xDelivery[i, l, k] for l in model.Locations) + sum(model.xDelivery[j, l, k] for l in model.Locations) <= 1)
+		for j in model.Hubs:
+			for v in range(len(vehicles_info)):
+				if k in vehicles_info[v, 0]:
+					model.constraints.add(model.y[vehicles_info[v, 4], k] >= model.y[j, k])
+					break
+			#if "carrier" in vehicles_info[v, 1]:
+			#	for i in model.Hubs:
+			#		model.constraints.add(model.l[i, j, k] == 0.0)
+		for j in model.Locations:
+			model.constraints.add(sum(model.l[i, j, k] for i in model.Locations if i != j) == model.y[j, k])
+			model.constraints.add(sum(model.l[j, i, k] for i in model.Locations if i != j) == model.y[j, k])
+	
+	# Scheduling constraints
+	for k in model.Mobile:
+		for i in model.Hubs:
+			model.constraints.add(model.Departure[i, k] == model.Arrival[i, k] + model.Waiting[i, k])
+			for j in model.Locations:
+				model.constraints.add(model.Weight[i, k] + sum(orders_size[n, 0]*model.xPickup[n, i, k] for n in model.Orders) + sum(orders_size[n, 0]*model.xPickup[n, j, k] for n in model.Orders) - sum(orders_size[n, 0]*model.xDelivery[n, i, k] for n in model.Orders) - model.Weight[j, k] <= 2000*(1 - model.l[i, j, k]))
+				model.constraints.add(model.Volume[i, k] + sum(orders_size[n, 1]*model.xPickup[n, i, k] for n in model.Orders) + sum(orders_size[n, 1]*model.xPickup[n, j, k] for n in model.Orders) - sum(orders_size[n, 1]*model.xDelivery[n, i, k] for n in model.Orders) - model.Weight[j, k] <= 2000*(1 - model.l[i, j, k]))
+				model.constraints.add(model.Departure[i, k] + travelTimes[i, j, typeOfMDH] - model.Arrival[j, k] <= 24*60*(1 - model.l[i, j, k]))
+				model.constraints.add(- model.Departure[i, k] - travelTimes[i, j, typeOfMDH] + model.Arrival[j, k] <= 24*60*(1 - model.l[i, j, k]))
+		for i in model.Depots:
+			model.constraints.add(model.Weight[i, k] >= sum(orders_size[n, 0]*model.xPickup[n, i, k] for n in model.Orders))
+			model.constraints.add(model.Volume[i, k] >= sum(orders_size[n, 1]*model.xPickup[n, i, k] for n in model.Orders))
+			for j in model.Locations:
+				model.constraints.add(model.Arrival[j, k] - model.Departure[i, k] - travelTimes[i, j, typeOfMDH] <= 24*60*(1 - model.l[i, j, k]))
+				model.constraints.add(- model.Arrival[j, k] + model.Departure[i, k] + travelTimes[i, j, typeOfMDH] <= 24*60*(1 - model.l[i, j, k]))
+		
+		for j in model.Locations:
+			for n in model.Orders:
+				model.constraints.add(model.Waiting[j, k] >= (travelTimes[orders_info[n, 4], j, typesOfLM] + travelTimes[j, orders_info[n, 4], typesOfLM] + serviceTime)*model.xPickup[n, j, k] + int(bool(locations_info[j, 1] != "depot"))*sum(serviceTime*(model.xPickup[i, j, k] + model.xDelivery[i, j, k]) for i in model.Orders))
+				model.constraints.add(model.Departure[j, k] >= (travelTimes[orders_info[n, 4], j, typesOfLM] + orders_time[n, 0])*model.xPickup[n, j, k])
+				# model.constraints.add(orders_time[n, 0] - travelTimes[j, orders_info[n, 4], typesOfLM] - model.Arrival[j, k] <= 24*60*(1 - model.xPickup[n, j, k]))
+				model.constraints.add(model.Waiting[j, k] >= (travelTimes[orders_info[n, 5], j, typesOfLM] + travelTimes[j, orders_info[n, 5], typesOfLM] + serviceTime)*model.xDelivery[n, j, k] + int(bool(locations_info[j, 1] != "depot"))*sum(serviceTime*(model.xPickup[i, j, k] + model.xDelivery[i, j, k]) for i in model.Orders))
+				model.constraints.add(model.Departure[j, k] >= (travelTimes[orders_info[n, 5], j, typesOfLM] + orders_time[n, 1])*model.xDelivery[n, j, k])
+				#model.constraints.add(orders_time[n, 1] - travelTimes[j, orders_info[n, 5], typesOfLM] - model.Arrival[j, k] <= 24*60*(1 - model.xDelivery[n, j, k]))
+				model.constraints.add(model.Arrival[j, k] + travelTimes[orders_info[n, 5], j, typesOfLM] - orders_time[n, 2] <= 24*60*(1 - model.xDelivery[n, j, k]))
+				#model.constraints.add(model.Departure[j, k] + travelTimes[orders_info[n, 5], j, typesOfLM] - orders_time[n, 2] <= 24*60*(1 - model.xDelivery[n, j, k]))
+				model.constraints.add(model.Departure[j, k] - model.Loaded[n] <= 24*60*(1 - model.xPickup[n, j, k]))
+				model.constraints.add(- model.Departure[j, k] + model.Loaded[n] <= 24*60*(1 - model.xPickup[n, j, k]))
+				model.constraints.add(model.Arrival[j, k] - model.Released[n] <= 24*60*(1 - model.xDelivery[n, j, k]))
+				model.constraints.add(- model.Arrival[j, k] + model.Released[n] <= 24*60*(1 - model.xDelivery[n, j, k]))
+		
 		for v in range(len(vehicles_info)):
 			if k in vehicles_info[v, 0]:
-				for j in model.Locations:
-					if len(model.Hubs) > 0:
-						model.constraints.add(model.l[j, j, k] == 0.0) #Invalid route 'j'-->'j' is not permitted.
-					if vehicles_info[v, 4] == j: # All mobile hubs will start from the current location, if used.
-						model.constraints.add(sum(model.l[j, i, k] for i in model.Hubs) == model.t[k])
-						model.constraints.add(sum(model.l[i, j, k] for i in model.Hubs) == model.t[k])
-					if j not in model.Depots:
-						# Constraints to define the sequence of locations visited by all mobile hubs, with respect to capacity.
-						model.constraints.add(sum(model.l[i, j, k] for i in model.Locations) == model.y[j, k])
-						model.constraints.add(sum(model.l[j, i, k] for i in model.Locations) == model.y[j, k])
-						model.constraints.add(model.Departure[j, k] >= model.Arrival[j, k] + model.Waiting[j, k])
-					for i in model.Locations:
-						if i != j:
-							model.constraints.add(minInterval*model.Departure[j, k] + travelTimes[j, i, typeOfMDH] - minInterval*model.Arrival[i, k] <= (locations_time[j, 1] + travelTimes[j, i, typeOfMDH])*(1 - model.l[j, i, k]))
-							model.constraints.add(minInterval*model.Arrival[i, k] - minInterval - minInterval*model.Departure[j, k] - travelTimes[j, i, typeOfMDH] <= (locations_time[i, 1])*(1 - model.l[j, i, k]))
-							if "carrier" in vehicles_info[v, 1]:
-								if i in model.Hubs and j in model.Hubs:
-									model.constraints.add(model.l[i, j, k] == 0.0)
 				break
-		for j in model.Hubs:
-			model.constraints.add(model.t[k] >= model.y[j, k])
+	
 	for k in range(nMobile):
 		for c in range(len(copies[k])):
 			for v in range(len(vehicles_info)):
 				if copies[k][c] in vehicles_info[v, 0]:
-					# Capacity constraints for mobile hubs.
-					model.constraints.add(sum(orders_size[i, 0]*model.xPickup[i, j, copies[k][c]] for i in model.Orders for j in model.Locations) <= vehicles_size[v, 0])
-					model.constraints.add(sum(orders_size[i, 1]*model.xPickup[i, j, copies[k][c]] for i in model.Orders for j in model.Locations) <= vehicles_size[v, 1])
-					model.constraints.add(sum(model.xPickup[i, j, copies[k][c]] for i in model.Orders for j in model.Locations) <= vehicles_size[v, 5])
+					break
 			if c > 0:
-				for j in model.Depots:
-					# No overlap constraints for mobile hubs to perform multiple trips
-					model.constraints.add(model.Departure[j, copies[k][c]] >= model.Arrival[j, copies[k][c-1]] + 2)
-					model.constraints.add(minInterval*model.Departure[j, copies[k][c]] >= minInterval*model.Arrival[j, copies[k][c-1]] + minInterval*model.Waiting[j, copies[k][c]])
-
+				model.constraints.add(model.Departure[vehicles_info[v, 4], copies[k][c]] >= model.Arrival[vehicles_info[v, 4], copies[k][c-1]] + sum(model.xDelivery[n, j, copies[k][c-1]] for n in model.Orders) + sum(model.xPickup[n, j, copies[k][c]] for n in model.Orders))
+				
 	return model
 
-def solve_mcc(model, timelimit, solver, locations_info, locations_time, routes, orders_info, vehicles_info, vehicles_size, incType, completed):
-	minInterval, allOperators = 5, list(set([vehicles_info[v, 6] for v in range(len(vehicles_info)) if "last-mile" in vehicles_info[v, 1]]))
+def solve_mcc(model, timelimit, solver, locations_info, locations_time, routes, orders_info, vehicles_info, vehicles_size, eligibleTypes, travelTimes):
 	if model != None:
 		slv, slv.options['timelimit']  = SolverFactory(solver), timelimit
 		try:
 			results_obj = slv.solve(model, tee = False, warmstart = True)
+
 			if results_obj.solver.termination_condition != TerminationCondition.infeasible and results_obj.solver.status != SolverStatus.unknown:
-				routes, toUnload = {}, {}
-				for o in allOperators:
-					toUnload[o] = []
+				routes = {}
 				for k in model.Mobile:
-					if value(model.t[k]) > 0.9:
-						for v in range(len(vehicles_info)):
-							if k in vehicles_info[v, 0]:
-								mdh, hasCarriers = "", bool("carrier" in vehicles_info[v, 1])
-								for char in vehicles_info[v, 0][0]:
-									if char != "*":
-										mdh += char
-									else:
-										break
+					for v in range(len(vehicles_info)):
+						if k in vehicles_info[v, 0]:
+							break
+					if value(model.y[vehicles_info[v, 4], k]) > 0.9:
+						mdh, hasCarriers = "", bool("carrier" in vehicles_info[v, 1])
+						for char in vehicles_info[v, 0][0]:
+							if char != "*":
+								mdh += char
+							else:
 								break
 						if mdh not in [key for key in routes.keys()]:
-							routes[mdh], nTrips, reLoad = {}, 0, locations_time[int(vehicles_info[v, 4]), 0]
+							routes[mdh], nTrips, lastLoad, arrivalTime = {}, 0, [], locations_time[vehicles_info[v, 4], 0]
 						else:
-							nTrips = len([key for key in routes[mdh].keys()])
-						if hasCarriers == False:
-							for t in range(24*60):
-								for i in model.Locations:
-									for j in model.Locations:
-										if value(model.l[i, j, k]) > 0.9 and minInterval*value(model.Departure[i, k]) >= t and minInterval*value(model.Departure[i, k]) < t+1:
-											if i in model.Depots:
-												startTime = reLoad
+							nTrips = len([key for key in routes[mdh].keys()])-1 
+							lastLoad = [n for n in routes[mdh][nTrips]['deliveries']]
+						
+						startNode, nextNode = vehicles_info[v, 4], None
+						routes[mdh][nTrips] = {"location": locations_info[startNode, 0], "pickups": [n for n in model.Orders if value(model.xPickup[n, startNode, k]) > 0.9], "deliveries": [n for n in lastLoad], "timeWindow": [arrivalTime, int(value(model.Departure[startNode, k]))], "vehicles" : {}, "customers": 0}
+						nTrips += 1
+						while(nextNode != vehicles_info[v, 4]):
+							for j in model.Locations:
+								if value(model.l[startNode, j, k]) > 0.9:
+									pickups, deliveries, nCustomers = [], [], 0
+									if j != vehicles_info[v, 4]:
+										for n in model.Orders:
+											if value(model.xPickup[n, j, k]) > 0.9:
+												pickups.append(n)
+												if j != orders_info[n, 4]:
+													nCustomers += 1
+											if value(model.xDelivery[n, j, k]) > 0.9:
+												deliveries.append(n)
+												if j != orders_info[n, 5]:
+													nCustomers += 1
+										if len(pickups) + len(deliveries) > 0:
+											numVehicles, routes[mdh][nTrips] = 0, {"location": locations_info[j, 0], "pickups": [n for n in pickups], "deliveries": [n for n in deliveries], "timeWindow": [int(value(model.Arrival[j, k])), int(value(model.Departure[j, k]))], "vehicles" : {}, "customers": nCustomers}
+											if hasCarriers == False:
+												for p in range(len(vehicles_info)):
+													if "last-mile" in vehicles_info[p, 1]:
+														vType = [l for l in vehicles_info[p, 1] if l in ["carrier", "van", "bike", "scooter", "droid"]][0]
+														vId = ""
+														for char in vehicles_info[p, 0][0]:
+															if char != "*":
+																vId += char
+															else:
+																break
+														routes[mdh][nTrips]['vehicles'][str(numVehicles)] = {"id": vId, "releaseTime" : int(vehicles_info[p, 5]), "capacity1" : vehicles_size[p, 0], "capacity2" : vehicles_size[p, 1], "type": vType}
+														numVehicles += 1
 											else:
-												startTime = minInterval*int(value(model.Arrival[i, k]))
-											if j in model.Depots:
-												reLoad = minInterval*int(value(model.Arrival[j, k]))
-											duplicates = []
-											for o in allOperators:
-												pickups, deliveries, nCustomers = [], [], 0
-												for n in model.Orders:
-													if value(model.xPickup[n, i, k]) > 0.9 and orders_info[n, 8] == o:
-														pickups.append(n)
-														if locations_info[orders_info[n, 4], 0] != locations_info[i, 0]:
-															toUnload[o].append(n)
-															nCustomers += 1
-													if value(model.xDelivery[n, i, k]) > 0.9 and orders_info[n, 8] == o:
-														deliveries.append(n)
-														if locations_info[orders_info[n, 5], 0] != locations_info[i, 0]:
-															nCustomers += 1
-												if len(pickups) + len(deliveries) > 0:
-													duplicates.append(nTrips)
-													if i in model.Depots:
-														numVehicles, routes[mdh][nTrips] = 0, {"location": locations_info[i, 0], "pickups": [n for n in pickups], "deliveries": [n for n in toUnload[o]], "timeWindow": [startTime, minInterval*int(value(model.Departure[i, k]))], "vehicles" : {}, "customers": nCustomers, "operator": o, "duplicates": []}
-													else:
-														numVehicles, routes[mdh][nTrips] = 0, {"location": locations_info[i, 0], "pickups": [n for n in pickups], "deliveries": [n for n in deliveries], "timeWindow": [startTime, minInterval*int(value(model.Departure[i, k]))], "vehicles" : {}, "customers": nCustomers, "operator": o, "duplicates": []}
-													for c in duplicates:
-														routes[mdh][c]["duplicates"] = duplicates
-													for v in range(len(vehicles_info)):
-														if "last-mile" in vehicles_info[v, 1] and vehicles_info[v, 6] == o:
-															vType = [l for l in vehicles_info[v, 1] if l in ["carrier", "van", "bike", "scooter", "droid"]][0]
-															vId = ""
-															for char in vehicles_info[v, 0][0]:
-																if char != "*":
-																	vId += char
-																else:
-																	break
-															routes[mdh][nTrips]['vehicles'][str(numVehicles)] = {"id": vId, "releaseTime" : int(vehicles_info[v, 5]), "capacity1" : vehicles_size[v, 0], "capacity2" : vehicles_size[v, 1], "type": vType}
-															numVehicles += 1
-													nTrips += 1
-						else:
-							for t in range(24*60):
-								for i in model.Locations:
-									for j in model.Locations:
-										if value(model.l[i, j, k]) > 0.9 and minInterval*value(model.Departure[i, k]) >= t and minInterval*value(model.Departure[i, k]) < t+1:
-											if i in model.Depots:
-												startTime = reLoad
+												for p in range(len(vehicles_info)):
+													if k in vehicles_info[p, 0][0]:
+														vType = "carrier"
+														routes[mdh][nTrips]['vehicles']['0'] = {"id": k, "releaseTime" : int(vehicles_info[p, 5]), "capacity1" : vehicles_size[p, 0], "capacity2" : vehicles_size[p, 1], "type": vType}
+											nTrips += 1
+									nextNode = j
+									startNode = nextNode
+									if nextNode == vehicles_info[v, 4]:
+										routes[mdh][nTrips] = {"location": locations_info[nextNode, 0], "pickups": [], "deliveries": [n for n in model.Orders if value(model.xDelivery[n, nextNode, k]) > 0.9], "timeWindow": [int(value(model.Arrival[nextNode, k])), int(value(model.Arrival[nextNode, k]))+60], "vehicles" : {}, "customers": 0}
+										for n in routes[mdh][nTrips]['deliveries']:
+											if orders_info[n, 5] != nextNode:
+												routes[mdh][nTrips]['customers'] += 1
+										for n in routes[mdh][nTrips]['pickups']:
+											if orders_info[n, 4] != nextNode:
+												routes[mdh][nTrips]['customers'] += 1
+										arrivalTime = int(value(model.Arrival[nextNode, k]))
+										if routes[mdh][nTrips]['customers'] > 0:
+											numVehicles = 0
+											if hasCarriers == False:
+												for p in range(len(vehicles_info)):
+													if "last-mile" in vehicles_info[p, 1]:
+														vType = [l for l in vehicles_info[p, 1] if l in ["carrier", "van", "bike", "scooter", "droid"]][0]
+														vId = ""
+														for char in vehicles_info[p, 0][0]:
+															if char != "*":
+																vId += char
+															else:
+																break
+														routes[mdh][nTrips]['vehicles'][str(numVehicles)] = {"id": vId, "releaseTime" : int(vehicles_info[p, 5]), "capacity1" : vehicles_size[p, 0], "capacity2" : vehicles_size[p, 1], "type": vType}
+														numVehicles += 1
 											else:
-												startTime = minInterval*int(value(model.Arrival[i, k]))
-											if j in model.Depots:
-												reLoad = minInterval*int(value(model.Arrival[j, k]))
-											for o in allOperators:
-												pickups, deliveries, duplicates, nCustomers = [], [], [], 0
-												for n in model.Orders:
-													if value(model.xPickup[n, i, k]) > 0.9 and orders_info[n, 8] == o:
-														pickups.append(n)
-														if locations_info[orders_info[n, 4], 0] != locations_info[i, 0]:
-															toUnload[o].append(n)
-															nCustomers += 1
-													if value(model.xDelivery[n, i, k]) > 0.9 and orders_info[n, 8] == o:
-														deliveries.append(n)
-														if locations_info[orders_info[n, 5], 0] != locations_info[i, 0]:
-															nCustomers += 1
-												if len(pickups) + len(deliveries) > 0:
-													duplicates.append(nTrips)
-													if i in model.Depots:
-														numVehicles, routes[mdh][nTrips] = 0, {"location": locations_info[i, 0], "pickups": [n for n in pickups], "deliveries": [n for n in toUnload[o]], "timeWindow": [startTime, minInterval*int(value(model.Departure[i, k]))], "vehicles" : {}, "customers": nCustomers, "operator": o, "duplicates": [nTrips]}
-													else:
-														numVehicles, routes[mdh][nTrips] = 0, {"location": locations_info[i, 0], "pickups": [n for n in pickups], "deliveries": [n for n in deliveries], "timeWindow": [startTime, minInterval*int(value(model.Departure[i, k]))], "vehicles" : {}, "customers": nCustomers, "operator": o, "duplicates": [nTrips]}
-													for c in duplicates:
-														routes[mdh][c]["duplicates"] = duplicates
-													for v in range(len(vehicles_info)):
-														if k in vehicles_info[v, 0][0] and vehicles_info[v, 6] == o:
-															vType = "carrier"
-															routes[mdh][nTrips]['vehicles']['0'] = {"id": k, "releaseTime" : int(vehicles_info[v, 5]), "capacity1" : vehicles_size[v, 0], "capacity2" : vehicles_size[v, 1], "type": vType}
-													nTrips += 1
+												for p in range(len(vehicles_info)):
+													if k in vehicles_info[p, 0][0]:
+														vType = "carrier"
+														routes[mdh][nTrips]['vehicles']['0'] = {"id": k, "releaseTime" : int(vehicles_info[p, 5]), "capacity1" : vehicles_size[p, 0], "capacity2" : vehicles_size[p, 1], "type": vType}
+										nTrips += 1
+									break
 				print(datetime.now(), f" - Computation of MDH schedule completed.")
 			else:
 				routes = False
@@ -285,17 +288,26 @@ def solve_mcc(model, timelimit, solver, locations_info, locations_time, routes, 
 			routes = False
 			print(datetime.now(), f" - Algorithm killed: Infeasible solution.")
 	else:
-		for o in allOperators:
-			routes[f"Depot_{incType}_{o}"], numVehicles = {}, 0
-			for i in range(len(locations_info)):
-				if locations_info[i, 1] == "depot":
-					routes[f"Depot_{incType}_{o}"][0] = {"location" : locations_info[i, 0], "pickups" : [], "deliveries" : [n for n in range(len(orders_info)) if n not in completed], "timeWindow" : [locations_time[i, 0], locations_time[i, 1]], "vehicles" : {}, 'customers' : len(orders_info), 'operator': o, "duplicates": [0]}
-					for v in range(len(vehicles_info)):
-						if "last-mile" in vehicles_info[v, 1] and incType in vehicles_info[v, 1] and "mobile" not in vehicles_info[v, 1] and vehicles_info[v, 6] == o:
-							routes[f"Depot_{incType}_{o}"][0]["vehicles"][str(numVehicles)] = {"releaseTime" : 0, "capacity1" : vehicles_size[v, 0], "capacity2" : vehicles_size[v, 1], "type": incType}
-							numVehicles += 1
-					break
-
+		routes = {}
+		for j in range(len(locations_info)):
+			if locations_info[j, 1] == "depot":
+				routes['depot'] = {}
+				routes['depot'][0] = {'location': locations_info[j, 0], "pickups": [n for n in range(len(orders_info)) if orders_info[n, 3] == 1], "deliveries": [n for n in range(len(orders_info)) if orders_info[n, 2] == 1]}
+				routes['depot'][0]['timeWindow'] = [locations_time[j, 0], locations_time[j, 1]]
+				routes['depot'][0]['vehicles'] = {}
+				routes['depot'][0]['customers'] = len(orders_info)
+				numVehicles = 0
+				for v in range(len(vehicles_info)):
+					if "last-mile" in vehicles_info[v, 1]:
+						vType = [l for l in vehicles_info[v, 1] if l in ["carrier", "van", "bike", "scooter", "droid"]][0]
+						vId = ""
+						for char in vehicles_info[v, 0][0]:
+							if char != "*":
+								vId += char
+							else:
+								break
+						routes['depot'][0]['vehicles'][str(numVehicles)] = {"id": vId, "releaseTime" : int(vehicles_info[v, 5]), "capacity1" : vehicles_size[v, 0], "capacity2" : vehicles_size[v, 1], "type": vType}
+						numVehicles += 1
 	return routes
 
 def get_warmstart(model, timelimit, solver):
@@ -318,19 +330,13 @@ def get_warmstart(model, timelimit, solver):
 					except Exception:
 						warmPickup[i][j][k] = 0.0
 		warmY = {}
-		for j in model.Hubs:
+		for j in model.Locations:
 			warmY[j] = {}
 			for k in model.Mobile:
 				try:
 					warmY[j][k] = value(model.y[j, k])
 				except Exception:
 					warmY[j][k] = 0.0
-		warmT = {}
-		for k in model.Mobile:
-			try:
-				warmT[k] = value(model.t[k])
-			except Exception:
-				warmT[k] = 0.0
 		warmL = {}
 		for i in model.Locations:
 			warmL[i] = {}
@@ -360,5 +366,5 @@ def get_warmstart(model, timelimit, solver):
 		maxOrders = int(0.5*value(model.z))
 	except Exception:
 		print(datetime.now(), f" - Computation of warm start solution failed.")
-		warmDelivery, warmPickup, warmY, warmT, warmL, warmArrival, warmDeparture, warmWaiting, maxOrders = None, None, None, None, None, None, None, None, 0
-	return warmDelivery, warmPickup, warmY, warmT, warmL, warmArrival, warmDeparture, warmWaiting, maxOrders
+		warmDelivery, warmPickup, warmY, warmL, warmArrival, warmDeparture, warmWaiting, maxOrders = None, None, None, None, None, None, None, None, 0
+	return warmDelivery, warmPickup, warmY, warmL, warmArrival, warmDeparture, warmWaiting, maxOrders
